@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 import sys
+import re
 
 import torch
 import torch.nn as nn
@@ -18,12 +19,15 @@ from torch.nn import functional as F
 # Config
 from gpt_conf import GPTConfig
 
+# Checkpointing
+import torch.utils.checkpoint as checkpoint
+
 # Variations
-from variations.softmax_variations import softmax_dictionary, Softermax, ConSmax, ConSmaxQuan, SaturatingConSmax, Strongermax, Polymax, PolymaxQuan, SigSoftmax, ExpPolymax, Softplus, Squareplus
+from variations.softmax_variations import softmax_dictionary, Softermax, ConSmax, ConSmaxQuan, SaturatingConSmax, Strongermax, Polymax, SigSoftmax, ExpPolymax, Softplus, Squareplus
 from variations.norm_variations import norm_dictionary, LayerNorm, RMSNorm, pRMSNorm, kRMSNorm
 from variations.position_encoding_variations import RotaryEmbedding, ShortRope, SymmetricalOverlapAngularPositions, FIRE
 from variations.activation_variations import SquaredReLU, activation_dictionary
-from variations.linear_variations import BitLinear1p58, BitLinear, BitLinearOptimized,KAL_Net as KAN, linear_dictionary
+from variations.linear_variations import BitLinear1p58, BitLinear, BitLinearOptimized, KAL_Net as KAN, linear_dictionary
 
 def create_shared_param_group(layer_type, config):
     shared_size = None
@@ -96,14 +100,10 @@ class CausalSelfAttention(nn.Module):
             self.n_kv_group = config.n_kv_group
 
         self.kv_dim = (config.n_embd // config.n_head) * self.n_kv_group
-        if config.linear_variant == "KAN":  
-            self.c_attn_k = KAN([config.n_embd, self.kv_dim])
-            self.c_attn_v = KAN([config.n_embd, self.kv_dim])
-            self.c_proj = KAN([config.n_embd, config.n_embd])
-        else:
-            self.c_attn_k = nn.Linear(config.n_embd, self.kv_dim, bias=config.bias)
-            self.c_attn_v = nn.Linear(config.n_embd, self.kv_dim, bias=config.bias)
-            self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_attn_k = nn.Linear(config.n_embd, self.kv_dim, bias=config.bias)
+        self.c_attn_v = nn.Linear(config.n_embd, self.kv_dim, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -127,9 +127,11 @@ class CausalSelfAttention(nn.Module):
         self.rotary_emb_k = None
         if config.use_rotary_embeddings:
             # TODO update variant name after completing rope and shortrope updates
+            # TODO Add shortrope to symmetrical rope
             if config.rope_variant == "rope":
-                self.rotary_emb_q = SymmetricalOverlapAngularPositions(config, size=config.n_embd)
-                self.rotary_emb_k = SymmetricalOverlapAngularPositions(config, size=self.kv_dim, num_angles=256)
+                self.sym_rot_num_angles = config.sym_rot_num_angles
+                self.rotary_emb_q = SymmetricalOverlapAngularPositions(config, size=config.n_embd, num_angles=self.sym_rot_num_angles)
+                self.rotary_emb_k = SymmetricalOverlapAngularPositions(config, size=self.kv_dim, num_angles=self.sym_rot_num_angles)
             # TODO update rope and shortrope to accomodate new GQA additions
             # if config.rope_variant == "rope":
             #     self.rotary_emb_q = RotaryEmbedding(config, size=config.n_embd)
@@ -225,7 +227,7 @@ class CausalSelfAttention(nn.Module):
                 att = att.masked_fill(window_mask == 0, float('-inf'))
             else:
                 # regular lower triangle attention
-                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+                att = att.masked_fill(self.bias[:,:,:T,:T].to(x.device) == 0, float('-inf'))
 
             # fire position embeddings
             if self.use_fire_embeddings is not None:
@@ -252,34 +254,49 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-
     def __init__(self, config):
         super().__init__()
 
         # Select linear variant
         self.linear_variant = linear_dictionary[config.linear_variant]
-        if config.linear_variant == "KAN":
-            self.c_fc = self.linear_variant([config.n_embd, 4 * config.n_embd])
-        else:
-            self.c_fc = self.linear_variant(config.n_embd, 4 * config.n_embd, bias=config.bias)
 
         # Select activation variant
         self.activation_variant = activation_dictionary[config.activation_variant]
-        if config.linear_variant == "KAN":
-            self.c_proj = self.linear_variant([4 * config.n_embd, config.n_embd])
-        else:
-            self.c_proj = self.linear_variant(4 * config.n_embd, config.n_embd, bias=config.bias)
+
+        # Select mlp variant
+        self.mlp_variant = config.mlp_variant
+
+        if self.mlp_variant == "kan":
+            self.kan = linear_dictionary["kan"](config.n_embd, config.n_embd, config=config)
+        if self.mlp_variant == "mlp":
+            self.c_fc = linear_dictionary[config.linear_variant](config.n_embd, 4 * config.n_embd, config=config)
+            self.c_proj = linear_dictionary[config.linear_variant](4 * config.n_embd, config.n_embd, config=config)
+        if self.mlp_variant == "swiglu":
+            self.c_fc_in1 = linear_dictionary[config.linear_variant](config.n_embd, 4 * config.n_embd, config=config)
+            self.c_fc_in2 = linear_dictionary[config.linear_variant](config.n_embd, 4 * config.n_embd, config=config)
+            self.c_fc_out = linear_dictionary[config.linear_variant](4 * config.n_embd, config.n_embd, config=config)
+
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.activation_variant(x)
-        x = self.c_proj(x)
+        if self.mlp_variant == "kan":
+            x = self.kan(x)
+        elif self.mlp_variant == "mlp":
+            x = self.c_fc(x)
+            x = self.activation_variant(x)
+            x = self.c_proj(x)
+        elif self.mlp_variant == "swiglu":
+            x_in1 = self.c_fc_in1(x)
+            x_in1 = self.activation_variant(x_in1)
+            x_in2 = self.c_fc_in2(x)
+            x_out = x_in1 * x_in2
+            x = self.c_fc_out(x_out)
+
         x = self.dropout(x)
         return x
 
-class Block(nn.Module):
 
+class Block(nn.Module):
     def __init__(self, config, mlp=None, attn=None):
         super().__init__()
 
@@ -291,35 +308,42 @@ class Block(nn.Module):
 
         self.use_post_ln = config.use_post_ln
         self.use_parallel_mlp = config.use_parallel_mlp
+        self.use_gradient_checkpointing = config.use_gradient_checkpointing
 
         # Allow for sharing attn between blocks
-        if attn == None:
+        if attn is None:
             self.attn = CausalSelfAttention(config)
         else:
             self.attn = attn
 
         # Allow for sharing mlp between blocks
-        if mlp == None:
+        if mlp is None:
             self.mlp = MLP(config)
         else:
             self.mlp = mlp
 
     def forward(self, x):
-        if self.use_post_ln:
-            if self.use_parallel_mlp:
-                x = self.ln_1(x + self.attn(x) + self.mlp(x))
+        def custom_forward(*inputs):
+            x = inputs[0]
+            if self.use_post_ln:
+                if self.use_parallel_mlp:
+                    x = self.ln_1(x + self.attn(x) + self.mlp(x))
+                else:
+                    x = self.ln_1(x + self.attn(x))
+                    x = self.ln_2(x + self.mlp(x))
             else:
-                x = self.ln_1(x + self.attn(x))
-                x = self.ln_2(x + self.mlp(x))
-        else:
-            if self.use_parallel_mlp:
-                ln_1 = self.ln_1(x)
-                x = x + self.attn(ln_1) + self.mlp(ln_1)
-            else:
-                x = x + self.attn(self.ln_1(x))
-                x = x + self.mlp(self.ln_2(x))
-        return x
+                if self.use_parallel_mlp:
+                    ln_1 = self.ln_1(x)
+                    x = x + self.attn(ln_1) + self.mlp(ln_1)
+                else:
+                    x = x + self.attn(self.ln_1(x))
+                    x = x + self.mlp(self.ln_2(x))
+            return x
 
+        if self.use_gradient_checkpointing and x.requires_grad:
+            return checkpoint.checkpoint(custom_forward, x, use_reentrant=False)
+        else:
+            return custom_forward(x)
 
 class GPT(nn.Module):
 
@@ -380,6 +404,15 @@ class GPT(nn.Module):
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
+    def update_block_size(self, new_block_size):
+        # Function to increase block size dynamically
+        if new_block_size > self.config.block_size:
+            self.config.block_size = new_block_size
+            self.transformer.wpe = nn.Embedding(new_block_size, self.config.n_embd)
+            for block in self.transformer.h:
+                if hasattr(block.attn, 'bias'):
+                    block.attn.bias = torch.tril(torch.ones(new_block_size, new_block_size)).view(1, 1, new_block_size, new_block_size)
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -388,22 +421,40 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def update_num_angles(self, num_angles):
+        """Update the number of angles for rotary embeddings in all attention layers."""
+        device = next(self.parameters()).device
+        for block in self.transformer.h:
+            if hasattr(block.attn, 'rotary_emb_q') and hasattr(block.attn, 'rotary_emb_k'):
+                block.attn.rotary_emb_q.update_num_angles(num_angles, device)
+                block.attn.rotary_emb_k.update_num_angles(num_angles, device)
+
+
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        # assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         x = None
         if self.config.use_abs_pos_embeddings:
+          pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
           pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
           x = self.transformer.drop(tok_emb + pos_emb)
         else:
           x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
             x = block(x)
+
+        x.requires_grad_(True)  # Ensure requires_grad is True
+
+        for block in self.transformer.h:
+            if self.config.use_gradient_checkpointing:
+                x = checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -558,3 +609,31 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+    @torch.no_grad()
+    def generate_with_stop(self, idx, max_new_tokens, stop_string, decode, temperature=1.0, top_k=None):
+        """
+        Generate tokens and stop on fixed string match, return the state for further input.
+        """
+        generated_text = ""
+        buffer = ""
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+
+            next_token_text = decode(idx_next[0].tolist())
+            generated_text += next_token_text
+            buffer += next_token_text
+
+            # Check if the buffer ends with the stop_string
+            if buffer.endswith(stop_string):
+                break
+
+        return idx, generated_text

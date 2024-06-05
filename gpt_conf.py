@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List
 
 @dataclass
 class GPTConfig:
@@ -12,7 +13,18 @@ class GPTConfig:
     window_size: int = 128
     gate: bool = False
 
+    # Training options
+    ## Gradient Checkpointing - More memory efficient (can do long contexts), but is slower
+    use_gradient_checkpointing: bool = False
+
+    # MLP Options
     use_parallel_mlp: bool = False
+    mlp_variant: str = "mlp"
+
+    ## KAN Option
+    kan_poly_order: int = 3
+    kan_base_activation: str = "silu"
+    kan_middle_layers: List[int] = field(default_factory=lambda: [])
 
     # Shared parameters
     # MLP
@@ -25,6 +37,9 @@ class GPTConfig:
     # Softmax Alternatives and Options
     softmax_variant_attn: str = "softmax" # Choices: "softmax" "softermax" "sigsoftmax" "polymax" "strongermax" "consmax"
     softmax_variant_output: str = "softmax" # Choices: "softmax" "softermax" "sigsoftmax" "polymax" "strongermax" "consmax"
+
+    ## General Options
+    div_by_seq_len: bool = False # for supported functions will divide by seq length
 
     ## ConSmax Options
     consmax_initial_beta: float = 2.0 # beta adjustment
@@ -63,11 +78,18 @@ class GPTConfig:
     exppolymax_power: float = 2.0
     exppolymax_divisor: float = 1.0
 
+    ## Softplus options
+    softplus_divisor: float = 100.0
+
+    ## Squareplus options
+    squareplus_divisor: float = 100.0
+
     # Positional Embeddings Variations
     use_abs_pos_embeddings: bool = True # Note: one can use this AND rotary embeddings
     use_fire_embeddings: bool = False
     shared_fire_embeddings: bool = False
     use_rotary_embeddings: bool = False
+    sym_rot_num_angles: int = 512
     rope_variant: str = "rope" # options: "shortrope", "rope"
     shortrope_length: int = 8 # number of embeddings to use in shortrope
 
